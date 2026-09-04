@@ -32,9 +32,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=apt-cache-$TARGET
     --mount=type=cache,target=/var/lib/apt,sharing=locked,id=apt-lib-$TARGETARCH \
     rm -f /etc/apt/apt.conf.d/docker-clean && \
     echo 'Acquire::Check-Valid-Until false;' > /etc/apt/apt.conf.d/snapshot && \
-    sed -i '/^URIs:/d; s|^# \(http://snapshot.debian.org/\)|URIs: \1|' /etc/apt/sources.list.d/debian.sources && \
+    sed -i '/^URIs:/d; s|^# http://snapshot.debian.org/|URIs: http://snapshot-cloudflare.debian.org/|' /etc/apt/sources.list.d/debian.sources && \
     apt-get update && \
-    apt-get install -y nfs-common e2fsprogs xfsprogs fdisk util-linux
+    apt-get install -y --no-install-recommends nfs-common e2fsprogs xfsprogs fdisk util-linux
 
 RUN --mount=type=bind,from=distroless-base,target=/base \
     --mount=type=bind,source=build/gather-node-deps.sh,target=/deps.sh \
@@ -44,32 +44,37 @@ RUN --mount=type=bind,from=distroless-base,target=/base \
 FROM distroless-base as dep-list
 COPY --link --from=debian /staging-node /
 
-FROM --platform=$BUILDPLATFORM registry-cn-hangzhou.ack.aliyuncs.com/dev/debian:bookworm-20260623-slim as build-0
+# blkid from source: newer libblkid mistakes non-filesystem data for a filesystem less often than
+# the one Debian stable ships, and a false positive makes us refuse to format an empty disk.
+FROM --platform=$BUILDPLATFORM registry-cn-hangzhou.ack.aliyuncs.com/dev/debian:bookworm-20260623-slim as build-util-linux
 ARG BUILDARCH
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=apt-cache-$BUILDARCH \
     --mount=type=cache,target=/var/lib/apt,sharing=locked,id=apt-lib-$BUILDARCH \
     rm -f /etc/apt/apt.conf.d/docker-clean && \
     echo 'Acquire::Check-Valid-Until false;' > /etc/apt/apt.conf.d/snapshot && \
-    sed -i '/^URIs:/d; s|^# \(http://snapshot.debian.org/\)|URIs: \1|' /etc/apt/sources.list.d/debian.sources && \
+    sed -i '/^URIs:/d; s|^# http://snapshot.debian.org/|URIs: http://snapshot-cloudflare.debian.org/|' /etc/apt/sources.list.d/debian.sources && \
     apt-get update && \
-    apt-get install -y tar xz-utils make diffutils
+    apt-get install -y --no-install-recommends tar xz-utils make diffutils dpkg-dev
 
-FROM build-0 as build-util-linux-amd64
-ENV HOST=x86_64-linux-gnu
-
-FROM build-0 as build-util-linux-arm64
-ENV HOST=aarch64-linux-gnu
-
-FROM build-util-linux-$TARGETARCH as build-util-linux
-ARG BUILDARCH
+# Above - shared by multiple TARGETARCH
+# Below - per-target
+ARG TARGETARCH
+# The target's libc via multiarch, not the libc6-dev-*-cross gcc recommends: those stay at the
+# revision the release froze at, and they put the libraries where libtool does not recognise a
+# system path, so it hardcodes a DT_RUNPATH into everything it links.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=apt-cache-$BUILDARCH \
     --mount=type=cache,target=/var/lib/apt,sharing=locked,id=apt-lib-$BUILDARCH <<EOF
 #!/bin/bash
-apt-get update && apt-get install -y gcc-${HOST//_/-}
+set -e
+eval "$(dpkg-architecture -a$TARGETARCH -s)"
+dpkg --add-architecture $DEB_HOST_ARCH
+apt-get update && apt-get install -y --no-install-recommends gcc-${DEB_HOST_GNU_TYPE//_/-} libc6-dev:$DEB_HOST_ARCH
 EOF
 
-ADD --link --checksum=sha256:6062a1d89b571a61932e6fc0211f36060c4183568b81ee866cf363bce9f6583e \
-    https://www.kernel.org/pub/linux/utils/util-linux/v2.41/util-linux-2.41.2.tar.xz /src.tar.xz
+# kernel.org takes ten minutes to serve this file to us.
+# The checksum is what makes the source trustworthy; the SBOM below names the canonical URL.
+ADD --link --checksum=sha256:f586e35d320ff537aab3ffeca37e9ecd482ccbe013590db4429a414d8aa6a728 \
+    https://mirrors.cernet.edu.cn/kernel.org/linux/utils/util-linux/v2.41/util-linux-2.41.5.tar.xz /src.tar.xz
 RUN mkdir -p /src && tar -C /src --strip-components=1 -xf /src.tar.xz
 
 RUN <<EOF
@@ -78,8 +83,14 @@ cd /src
 SOURCE_DATE_EPOCH=$(stat -c %Y /src.tar.xz)
 export SOURCE_DATE_EPOCH
 echo "util-linux released at $(date --date "@$SOURCE_DATE_EPOCH" --iso-8601=seconds)"
-./configure --disable-all-programs --enable-blkid --enable-libblkid --libdir=\${prefix}/lib/$HOST \
-    --disable-nls --disable-bash-completion --disable-asciidoc --disable-dependency-tracking --disable-static --host=$HOST
+# Build it the way Debian builds everything else in this image, incl. the security hardening.
+# blkid is what reads attacker-controlled bytes here.
+eval "$(dpkg-architecture -a$TARGETARCH -s)"
+export CC=$DEB_HOST_GNU_TYPE-gcc DEB_BUILD_MAINT_OPTIONS=hardening=+bindnow
+eval "$(dpkg-buildflags --export=sh)"
+./configure --disable-all-programs --enable-blkid --enable-libblkid --libdir=\${prefix}/lib/$DEB_HOST_MULTIARCH \
+    --disable-nls --disable-bash-completion --disable-asciidoc --disable-dependency-tracking --disable-static \
+    --host=$DEB_HOST_GNU_TYPE
 make -j
 make install-strip DESTDIR=/install
 mkdir -p /out
@@ -91,26 +102,26 @@ COPY <<"EOT" /out/usr/local/share/sbom/blkid.spdx.json
 {
     "spdxVersion": "SPDX-2.3",
     "SPDXID": "SPDXRef-DOCUMENT",
-    "name": "util-linux-2.41.2",
+    "name": "util-linux-2.41.5",
     "packages": [
         {
             "name": "util-linux",
             "SPDXID": "SPDXRef-Package-source-util-linux",
-            "versionInfo": "2.41.2",
+            "versionInfo": "2.41.5",
             "filesAnalyzed": false,
             "primaryPackagePurpose" : "SOURCE",
-            "packageFileName" : "util-linux-2.41.2.tar.xz",
-            "downloadLocation" : "https://www.kernel.org/pub/linux/utils/util-linux/v2.41/util-linux-2.41.2.tar.xz",
+            "packageFileName" : "util-linux-2.41.5.tar.xz",
+            "downloadLocation" : "https://www.kernel.org/pub/linux/utils/util-linux/v2.41/util-linux-2.41.5.tar.xz",
             "checksums" : [{
                 "algorithm" : "SHA256",
-                "checksumValue" : "6062a1d89b571a61932e6fc0211f36060c4183568b81ee866cf363bce9f6583e"
+                "checksumValue" : "f586e35d320ff537aab3ffeca37e9ecd482ccbe013590db4429a414d8aa6a728"
             }],
-            "releaseDate": "2025-09-22T11:32:01Z",
+            "releaseDate": "2026-06-16T12:20:59Z",
             "externalRefs": [
                 {
                     "referenceCategory": "SECURITY",
                     "referenceType": "cpe23Type",
-                    "referenceLocator": "cpe:2.3:a:util-linux:util-linux:2.41.2:*:*:*:*:*:*:*"
+                    "referenceLocator": "cpe:2.3:a:util-linux:util-linux:2.41.5:*:*:*:*:*:*:*"
                 }
             ]
         }
@@ -118,7 +129,7 @@ COPY <<"EOT" /out/usr/local/share/sbom/blkid.spdx.json
 }
 EOT
 
-RUN find /out -exec touch --reference=/src.tar.xz {} +
+RUN find /out -exec touch -h --reference=/src.tar.xz {} +
 
 FROM scratch as download-amd64
 ADD --link --checksum=sha256:751ce5f900a954ffb4c87eb530d4e5d63f449041f1816207334abdd09ebf8c70 \
